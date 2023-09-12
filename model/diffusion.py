@@ -10,6 +10,46 @@ from .unet import UNet
 
 
 class GaussianDiffusionModel(nn.Module):
+    """The denoising diffusion model.
+    
+    Parameters
+    ----------
+    betas : torch.Tensor
+        The standard deviations of the diffusion time steps
+    model_mean_type: str
+        Indicate what is predicted during the denoising process of the image.
+        For model_mean_type=xprev, we predict x_{t-1}
+        For model_mean_type=xstart, we predict x0
+        For model_mean_type=eps, we prodict epsilon
+    model_var_type: str
+        Indicate the type of variances we use for the denoising process.
+        In this implementation the variances are allways fixed. Even if their can be learnt,
+        this choice has been made because as explained in the paper, the training is unstable
+        with learnt variances.
+        For model_var_type=fixedsmall, the variances of the backward process are used.
+        For model_var_type=fixedlarde, the variance of the forward process posterions are used.
+    loss_type: str
+        Indicate the type of loss used for training.
+        For loss_type=mse we use the MSE Loss
+        For loss_type=kl we use the KL-Divergence
+    channels: int
+        Indicate the base number of channels used in the convolutions inside residual blocks
+    out_channels: int
+        Indicate the number of channels of the output image
+    ch_mult: Union[List[int], Tuple[int]]
+        Gives the multiplication factor of the channels of the residual blocks at each level of the UNet.
+    num_res_blocks: int
+        The number of residual blocks
+    att_levels: Union[List[int], Tuple[int]]
+        The levels where an attention block is added
+    num_groups: int
+        The number of groups used by the group normalization layers inside the UNet.
+        Must be diviser of channels
+    resample_with_conv: bool
+        Whether to upsample or downsample the images with convolution layers
+    p: float
+        The dropout probability
+    """
     def __init__(
         self,
         betas:torch.Tensor,
@@ -115,7 +155,23 @@ class GaussianDiffusionModel(nn.Module):
 
         return self
 
+    
     def extract(self, x:torch.Tensor, t:torch.Tensor, shape:Tuple[int]) -> torch.Tensor:
+        """Extracts the values from a given tensor at indices given by a list.
+            Args
+            ----
+            x: torch.Tensor
+                The input tensor
+            t: torch.Tensor
+                The indices
+            shape: Tuple[int]
+                The shape of the output
+            
+            Returns
+            -------
+            A tensor with shape `shape`with values of `x` at indices specified by `t`
+        """
+
         B, = t.shape
         assert B == shape[0], f"Error: t must have the same length as the batch size. Got {B} and {x.shape[0]}"
         out = x[t]
@@ -123,26 +179,64 @@ class GaussianDiffusionModel(nn.Module):
         return out.reshape(B, *([1]*len(shape[1:])))
 
     def q_mean_variance(self, x0:torch.Tensor, t:torch.Tensor) -> torch.Tensor:
+        """Gets the mean and the variance of the diffusion process at the given given time steps.
+            Args
+            ----
+            x0: torch.Tensor
+                The initial images
+            t: torch.Tensor
+                The time steps
+
+            Returns
+            -------
+            A tensor with the means and the variances
+        """
+
         mean = self.extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0
         variance = self.extract(1. - self.alphas_cumprod, t, x0.shape)
         log_variance = self.extract(self.log_one_minus_alphas_cumprod, t, x0.shape)
         return mean, variance, log_variance
 
-    def q_sample(self, x0:torch.Tensor, t:torch.Tensor, noise:Optional[torch.Tensor]=None) -> torch.Tensor:
+    def q_sample(self, xstart:torch.Tensor, t:torch.Tensor, noise:Optional[torch.Tensor]=None) -> torch.Tensor:
+        """Samples the resulting image at the given time step from the distribution of the diffusion process
+            Args
+            ----
+            xstart: torch.Tensor
+                The input image
+            t: torch.Tensor
+                The time steps
+            noise: Optional[torch.Tensor]
+                The noise use to generate the image
+            
+            Returns
+            -------
+            The images of the specified time steps
+        """
+
         if noise is None:
-            noise = torch.empty_like(x0).normal_()
+            noise = torch.empty_like(xstart).normal_()
 
         return (
-            self.extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0 +
-            self.extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
+            self.extract(self.sqrt_alphas_cumprod, t, xstart.shape) * xstart +
+            self.extract(self.sqrt_one_minus_alphas_cumprod, t, xstart.shape) * noise
         )
 
-    def q_posterior_mean_variance(self, x0:torch.Tensor, xt:torch.Tensor, t:torch.Tensor) -> Tuple[torch.Tensor]:
+    def q_posterior_mean_variance(self, xstart:torch.Tensor, xt:torch.Tensor, t:torch.Tensor) -> Tuple[torch.Tensor]:
+        """Gets the mean and the variance of the diffusion process posterior at the given time steps.
+            Args
+            ----
+            xstart: torch.Tensor
+                The initial images
+            t: torch.Tensor
+                The time steps
+
+            Returns
+            -------
+            A tensor with the means and the variances
         """
-        Compute the mean and variance of the diffusion posterior q(x_{t-1} | x_t, x_0)
-        """
+
         posterior_mean = (
-            self.extract(self.posterior_mean_coef1, t, xt.shape) * x0 +
+            self.extract(self.posterior_mean_coef1, t, xt.shape) * xstart +
             self.extract(self.posterior_mean_coef2, t, xt.shape) * xt
         )
 
@@ -151,18 +245,62 @@ class GaussianDiffusionModel(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def predict_xstart_from_xprev(self, xt:torch.Tensor, t:torch.Tensor, xprev:torch.Tensor) -> torch.Tensor:
+        """Predicts x_{t-1} from x_t and x0
+        Args
+        ----
+        xt: torch.Tensor
+            The image at time step `t`
+        t: torch.Tensor
+            The time step
+        xprev: torch.Tensor
+            The value of x0
+
+        Returns
+        -------
+        The value of x_{t-1}
+        """
+
         return (  # (xprev - coef2*x_t) / coef1
             self.extract(1. / self.posterior_mean_coef1, t, xt.shape) * xprev -
             self.extract(self.posterior_mean_coef2 / self.posterior_mean_coef1, t, xt.shape) * xt
         )
 
+
     def predict_xstart_from_eps(self, xt:torch.Tensor, t:torch.Tensor, eps:torch.Tensor) -> torch.Tensor:
+        """Predicts x_{t-1} from x_t and the noise
+        Args
+        ----
+        xt: torch.Tensor
+            The image at time step `t`
+        t: torch.Tensor
+            The time step
+        eps: torch.Tensor
+            The value of the noise
+
+        Returns
+        -------
+        The value of x_{t-1}
+        """
+
         return (
             self.extract(self.sqrt_recip_alphas_cumprod, t, xt.shape) * xt -
             self.extract(self.sqrt_recipm1_alphas_cumprod, t, xt.shape) * eps
         )
 
     def p_mean_variance(self, x:torch.Tensor, t:torch.Tensor, clip_denoised: bool, return_pred_xstart: bool) -> Tuple[torch.Tensor]:
+        """Gets the mean and the variance of the denoising process at the given time step.
+            Args
+            ----
+            x: torch.Tensor
+                The value of x_t
+            t: torch.Tensor
+                The time step
+
+            Returns
+            -------
+            A tensor with the means and the variances
+        """
+
         B, C, H, W = x.shape
         denoiser_out = self.denoiser(x, t)
         assert tuple(denoiser_out.shape) == (B, C, H, W)
@@ -200,14 +338,37 @@ class GaussianDiffusionModel(nn.Module):
               return model_mean, model_variance, model_log_variance
 
     def p_sample(self, x:torch.Tensor, t:torch.Tensor, clip_denoised:bool, return_pred_xstart:bool) -> Union[Tuple[torch.Tensor], torch.Tensor]:
+        """Samples x_{t-1} from x_t in the distribution of the denoising process
+            Args
+            ----
+            x: torch.Tensor
+                The value of x_t
+            t: torch.Tensor
+                The time step
+            
+            Returns
+            -------
+            The the value of x_{t-1}
+        """
+
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(x, t, clip_denoised, return_pred_xstart=True)
         noise = torch.empty_like(x).normal_()
         nonzero_mask = (t != 0).reshape(-1, *([1]*(len(x.shape)-1))) # shape = (B, 1, 1, ..., 1)
         sample = model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
         return (sample, pred_xstart) if return_pred_xstart else sample
 
-    
     def p_sample_loop(self, sample_shape:Tuple[int]) -> torch.Tensor:
+        """Loops over the whole denoising process starting from a random noise sample from standard normal distribution.
+            Args
+            ----
+            sample_shape: Tuple[int]
+                The shape of the image. Make sure it contains the batch dimension
+            
+            Returns
+            -------
+            The generated image
+        """
+
         device = self.betas.device
         sample = torch.empty(*sample_shape, device=device).normal_() # Initialize sample with noise
         for i in reversed(range(self.num_timesteps)):
@@ -218,12 +379,37 @@ class GaussianDiffusionModel(nn.Module):
 
     @torch.no_grad()
     def generate(self, shape:Tuple[int]) -> Image:
+        """Generate an new image with the given shape.
+            Args
+            ----
+            sample: Tuple[int]
+                The shape of the image.
+            
+            Returns
+            -------
+            The generated image
+        """
+        assert len(shape) >= 3 and len(shape) <= 4, f"Error: Expecting the length of shape to be either 3 or 4"
+        if len(shape) == 3:
+            shape = (1,) + shape
+
         img = self.p_sample_loop(shape)
         img = torchvision.transforms.functional.to_pil_image(img[0])
         return img
     
     @torch.no_grad()
-    def generation_evolution(self, shape:Tuple[int], filename) -> torch.Tensor:
+    def generation_evolution(self, shape:Tuple[int], filename:str) -> torch.Tensor:
+        """Generate an new image with the given shape and the video of the generation process.
+            Args
+            ----
+            sample: Tuple[int]
+                The shape of the image.
+            filename: str
+                The name of the video file.
+            Returns
+            -------
+            The generated image
+        """
         assert len(shape) == 3, f"Error: Expecting shape of format (C,H,W)"
         device = self.betas.device
         frame_height = shape[1]
@@ -249,6 +435,22 @@ class GaussianDiffusionModel(nn.Module):
 
     @staticmethod
     def normal_kl(mean1:torch.Tensor, logvar1:torch.Tensor, mean2:torch.Tensor, logvar2:torch.Tensor) -> torch.Tensor:
+        """Computes the KL-Divergence of two normal distributions
+            Args
+            ----
+            mean1: torch.Tensor
+                The mean of the first distribution
+            logvar1: torch.Tensor
+                The log-variance of the first distribution
+            mean2: torch.Tensor
+                The mean of the second distribution
+            logvar1: torch.Tensor
+                The log-variance of the second distribution
+            
+            Returns
+            -------
+            The KL-Divergence
+        """
         return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1 - logvar2)
                 + ((mean1-mean2)**2) * torch.exp(-logvar2))
 
@@ -276,6 +478,22 @@ class GaussianDiffusionModel(nn.Module):
         return log_probs
 
     def variational_bound_terms(self, xstart:torch.Tensor, xt:torch.Tensor, t:torch.Tensor, clip_denoised:bool, return_pred_xstart:bool) -> Union[Tuple[torch.Tensor], torch.Tensor]:
+        """Computes the variational bound terms (L_t in the paper)
+            Args
+            ----
+            xstart: torch.Tensor
+                The value of x0
+            xt: torch.Tensor
+                The value of x_t
+            t: torch.Tensor
+                The time step `t`
+            clip_denoised: bool
+                Whether to clip the denoised image
+            
+            Returns
+            -------
+            The value of L_t
+        """
         true_mean, _, true_log_variance_clipped = self.q_posterior_mean_variance(xstart, xt, t)
         model_mean, _, model_log_variance, pred_xstart = self.p_mean_variance(
           xt, t, clip_denoised, return_pred_xstart=True)

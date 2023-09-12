@@ -1,0 +1,18 @@
+timesteps: 1000
+beta_1: 0.0001
+beta_T: 0.02
+model_mean_type: eps
+model_var_type: fixedsmall
+loss_type: mse
+channels: 32
+out_channels: 3
+ch_mult:
+  - 1
+  - 2
+  - 2
+  - 2
+num_res_blocks: 2
+att_levels:
+  - 16
+resample_with_conv: true
+p: 0.0
